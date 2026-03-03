@@ -12,14 +12,15 @@ use rusqlite::{
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Key(String);
 
-impl<'a> TryFrom<Cow<'a, str>> for Key {
-    type Error = KeyError;
+impl<'a> From<Cow<'a, str>> for Key {
+    fn from(key: Cow<'a, str>) -> Self {
+        Self(key.into_owned())
+    }
+}
 
-    fn try_from(key: Cow<'a, str>) -> Result<Self, Self::Error> {
-        if key.starts_with(char::is_whitespace) || key.ends_with(char::is_whitespace) {
-            return Err(KeyError::Untrimmed);
-        }
-        Ok(Self(key.into_owned()))
+impl From<&str> for Key {
+    fn from(key: &str) -> Self {
+        Self(key.to_owned())
     }
 }
 
@@ -33,10 +34,4 @@ impl FromSql for Key {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         Ok(Self(String::column_result(value)?))
     }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum KeyError {
-    #[error("untrimmed")]
-    Untrimmed,
 }
