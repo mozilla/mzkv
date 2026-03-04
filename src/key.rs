@@ -24,6 +24,12 @@ impl From<&str> for Key {
     }
 }
 
+impl Key {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl ToSql for Key {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(self.0.as_str()))
