@@ -30,6 +30,31 @@ use crate::{
     schema::{Schema, SchemaError},
 };
 
+/// Trait for dispatching blocking store close work to a background thread.
+///
+/// When a `Store` with a `CloseSink` is dropped, the `Drop` impl extracts
+/// the open connections and passes them to the sink for asynchronous closing.
+/// The sink implementation chooses which thread to close on.
+pub trait CloseSink: Send + Sync {
+    fn schedule_close(&self, closeable: CloseableStore);
+}
+
+/// Holds the extracted connections from a dropped `Store`.
+///
+/// Call `close()` on a background I/O thread -- it runs `PRAGMA optimize`
+/// and closes both SQLite connections.
+pub struct CloseableStore {
+    store: Arc<OpenStore>,
+}
+
+impl CloseableStore {
+    pub fn close(self) {
+        Arc::into_inner(self.store)
+            .expect("invariant violation")
+            .close();
+    }
+}
+
 /// A persistent store backed by a physical SQLite database.
 ///
 /// Under the hood, a store holds two connections to the same physical database:
@@ -40,11 +65,22 @@ use crate::{
 ///   read from the physical database even if the read-write connection is busy,
 ///   and those reads can be interrupted. Reads on this connection won't see any
 ///   uncommitted changes on the read-write connection.
-#[derive(Debug)]
 pub struct Store {
     path: StorePath,
     state: Mutex<StoreState>,
     waiter: OperationWaiter,
+    close_sink: Option<Arc<dyn CloseSink>>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("path", &self.path)
+            .field("state", &self.state)
+            .field("waiter", &self.waiter)
+            .field("close_sink", &self.close_sink.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Store {
@@ -53,6 +89,16 @@ impl Store {
             path,
             state: Mutex::new(StoreState::Created),
             waiter: OperationWaiter::new(),
+            close_sink: None,
+        }
+    }
+
+    pub fn new_with_close_sink(path: StorePath, sink: Arc<dyn CloseSink>) -> Self {
+        Self {
+            path,
+            state: Mutex::new(StoreState::Created),
+            waiter: OperationWaiter::new(),
+            close_sink: Some(sink),
         }
     }
 
@@ -233,6 +279,21 @@ impl Store {
         let store = Arc::into_inner(store).expect("invariant violation");
 
         store.close();
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        let Some(sink) = self.close_sink.take() else {
+            return;
+        };
+        let state = mem::replace(&mut *self.state.lock().unwrap(), StoreState::Closed);
+        match state {
+            StoreState::Open(store) | StoreState::Maintenance(store) => {
+                sink.schedule_close(CloseableStore { store });
+            }
+            _ => {}
+        }
     }
 }
 

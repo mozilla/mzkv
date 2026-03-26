@@ -20,7 +20,7 @@ use hashbrown::hash_map::{Entry, HashMap};
 
 use crate::{
     abort::{AbortController, AbortSignal},
-    store::{Store, StorePath},
+    store::{CloseSink, Store, StorePath},
 };
 
 /// Manages access to all persistent stores.
@@ -66,25 +66,40 @@ use crate::{
 /// Check out [`crate::skv::interface::KeyValueService`] and
 /// [`crate::skv::interface::KeyValueDatabase`] for an example of
 /// hierarchies in action.
-#[derive(Debug)]
 pub struct Coordinator {
     state: Mutex<CoordinatorState>,
+    close_sink: Option<Arc<dyn CloseSink>>,
+}
+
+impl std::fmt::Debug for Coordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Coordinator")
+            .field("state", &self.state)
+            .field("close_sink", &self.close_sink.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Coordinator {
-    fn new() -> Self {
+    fn new(close_sink: Option<Arc<dyn CloseSink>>) -> Self {
         Coordinator {
             state: Mutex::new(CoordinatorState {
                 clients: BTreeMap::new(),
                 stores: HashMap::new(),
             }),
+            close_sink,
         }
     }
 
     /// Returns the singleton coordinator.
-    pub fn get_or_create() -> &'static Self {
+    ///
+    /// `close_sink`, if given, enables automatic connection cleanup
+    /// when stores are dropped. The sink is only used on the first call;
+    /// subsequent calls return the existing singleton regardless of the
+    /// argument.
+    pub fn get_or_create(close_sink: Option<Arc<dyn CloseSink>>) -> &'static Self {
         static COORDINATOR: OnceLock<Coordinator> = OnceLock::new();
-        COORDINATOR.get_or_init(Coordinator::new)
+        COORDINATOR.get_or_init(|| Coordinator::new(close_sink))
     }
 
     /// Creates a new coordinator client.
@@ -136,7 +151,11 @@ impl<'a> CoordinatorClient<'a> {
         match state.stores.entry(path) {
             Entry::Occupied(mut entry) => Ok(entry.get_mut().attach(self.key.clone())),
             Entry::Vacant(entry) => {
-                let store = InUseStore::new(Store::new(entry.key().clone()));
+                let store = match &self.coordinator.close_sink {
+                    Some(sink) => Store::new_with_close_sink(entry.key().clone(), sink.clone()),
+                    None => Store::new(entry.key().clone()),
+                };
+                let store = InUseStore::new(store);
                 Ok(entry.insert(store).attach(self.key.clone()))
             }
         }
@@ -198,8 +217,9 @@ impl<'a> CoordinatorClient<'a> {
     ///
     /// If the client or any of its descendants are the last clients
     /// of a store, invalidating the client will also close those stores.
-    /// **This can block on disk I/O**, so clients should not be
-    /// invalidated on the main thread.
+    /// Without a close sink, **this can block on disk I/O**, so clients
+    /// should not be invalidated on the main thread. With a close sink,
+    /// the actual close is dispatched to the sink and this returns promptly.
     pub fn invalidate(&self) {
         let (abortable_clients, closeable_stores) = {
             let mut state = self.coordinator.state.lock().unwrap();
@@ -251,7 +271,11 @@ impl<'a> CoordinatorClient<'a> {
         for store in closeable_stores {
             // Invariant: `into_inner` always succeeds for closeable stores.
             let store = store.into_inner().expect("invariant violation");
-            store.close();
+            if self.coordinator.close_sink.is_none() {
+                store.close();
+            }
+            // With a close sink, dropping the Arc<Store> triggers
+            // Store::drop(), which schedules the close via the sink.
         }
     }
 
