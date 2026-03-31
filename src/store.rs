@@ -253,7 +253,7 @@ impl StorePath {
     /// method normalizes string paths passed to the XPCOM
     /// [`crate::skv::interface`] methods.
     ///
-    /// **Canonicalization can accesses the filesystem**, so this method
+    /// **Canonicalization can access the filesystem**, so this method
     /// should not be called on the main thread.
     pub fn canonicalizing(path: PathBuf) -> Result<Self, StoreError> {
         Ok(if path.as_os_str() == StorePath::IN_MEMORY_DATABASE_NAME {
