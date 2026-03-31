@@ -90,6 +90,7 @@ impl Connection {
         // Turn off misfeatures: double-quoted strings and untrusted schemas.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
+        // We control the schema, turn off the unnecessary precautions.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, true)?;
 
         crate::functions::register(&mut conn)?;
