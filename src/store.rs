@@ -188,7 +188,7 @@ impl Store {
         Ok(Reader(self.open::<Checker>()?))
     }
 
-    #[cfg(feature = "gtest")]
+    #[cfg(any(feature = "gtest", feature = "testing"))]
     pub fn check<C>(&self) -> Result<(), StoreError>
     where
         for<'a> ConnectionIncidents<'a>: IntoChecker<C>,
