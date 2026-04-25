@@ -17,6 +17,12 @@ pub trait ConnectionPath {
     fn as_path(&self) -> Cow<'_, Path>;
 
     fn flags(&self) -> OpenFlags;
+
+    /// Name of a custom VFS module to use when opening the database.
+    /// Returning `None` (the default) selects SQLite's default VFS.
+    fn vfs(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// An error that indicates a potential problem with an SQLite database.
@@ -69,10 +75,13 @@ impl Connection {
         M: ConnectionMigrator,
         M::Error: From<rusqlite::Error>,
     {
-        let mut conn = rusqlite::Connection::open_with_flags(
-            path.as_path(),
-            path.flags().union(type_.flags()),
-        )?;
+        let flags = path.flags().union(type_.flags());
+        let mut conn = match path.vfs() {
+            Some(vfs) => {
+                rusqlite::Connection::open_with_flags_and_vfs(path.as_path(), flags, vfs)?
+            }
+            None => rusqlite::Connection::open_with_flags(path.as_path(), flags)?,
+        };
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;

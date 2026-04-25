@@ -236,12 +236,46 @@ impl Store {
     }
 }
 
-/// Either a path to a physical SQLite database file on disk, or
-/// a reference to a unique in-memory database.
+/// Either a path to a physical SQLite database file on disk,
+/// a reference to a unique in-memory database, or an explicit SQLite URI
+/// (with an optional custom VFS name).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StorePath {
     OnDisk(PathBuf),
     InMemory(usize),
+    /// An arbitrary SQLite URI, with an optional custom VFS module name.
+    ///
+    /// **This variant must not be constructed from untrusted input.** SQLite
+    /// parses the URI itself and honors query parameters that affect security:
+    ///
+    /// - `nolock=1`, `immutable=1` - disable file locking and integrity
+    ///   checks; concurrent writers will silently corrupt the database.
+    /// - `mode=ro|rw|rwc|memory` - overrides the access mode implied by
+    ///   the [`ConnectionType`] passed to [`Connection::new`].
+    /// - `cache=shared|private` - affects connection-pool concurrency.
+    /// - `vfs=<name>` - an in-URI VFS request; silently shadowed by the
+    ///   `vfs` field of this variant (the explicit `zVfs` parameter to
+    ///   `sqlite3_open_v2` takes precedence), but confusing in combination.
+    ///
+    /// Callers must validate or generate the URI from a trusted template;
+    /// never pass user-controlled input through without sanitizing it.
+    ///
+    /// The `vfs` field is equally security-sensitive: selecting a VFS that
+    /// disables locking (e.g. SQLite's built-in `unix-none`) will silently
+    /// remove concurrency safety even if the URI itself is otherwise pristine.
+    ///
+    /// **Deduplication:** equality and hashing compare the `uri` string
+    /// byte-for-byte. Two equivalent-but-differently-spelled URIs (e.g.
+    /// `file:/x/db` vs `file:///x/db`, or differently-ordered query
+    /// parameters) produce distinct `StorePath` keys in the coordinator.
+    /// Callers that rely on the coordinator's per-path deduplication must
+    /// canonicalize the URI before construction; this variant provides no
+    /// automatic normalization the way [`StorePath::canonicalizing`] does
+    /// for the `OnDisk` variant.
+    ///
+    /// `SQLITE_OPEN_URI` is always set so that SQLite parses the string as
+    /// a URI rather than a plain filename.
+    Uri { uri: String, vfs: Option<String> },
 }
 
 impl StorePath {
@@ -283,6 +317,19 @@ impl StorePath {
         Self::InMemory(id)
     }
 
+    /// Returns a store path that opens the given SQLite URI verbatim,
+    /// optionally through a custom VFS.
+    ///
+    /// **Security:** see [`StorePath::Uri`] - the URI and VFS name must
+    /// come from a trusted source. Callers are responsible for input
+    /// validation and URI canonicalization.
+    pub fn for_uri(uri: impl Into<String>, vfs: Option<String>) -> Self {
+        Self::Uri {
+            uri: uri.into(),
+            vfs,
+        }
+    }
+
     /// If this path is to a physical database file on disk,
     /// returns a reference to the path.
     pub fn on_disk(&self) -> Option<OnDiskStorePath<'_>> {
@@ -290,7 +337,7 @@ impl StorePath {
             Self::OnDisk(buf) => buf
                 .file_name()
                 .map(|name| OnDiskStorePath::new(buf.parent(), name.into())),
-            Self::InMemory(_) => None,
+            Self::InMemory(_) | Self::Uri { .. } => None,
         }
     }
 }
@@ -305,13 +352,14 @@ impl ConnectionPath for StorePath {
                 // names the database and enables shared-cache mode.
                 Cow::Owned(format!("file:kvstore-{id}?mode=memory&cache=shared").into())
             }
+            Self::Uri { uri, .. } => Cow::Owned(uri.as_str().into()),
         }
     }
 
     fn flags(&self) -> OpenFlags {
         match self {
             Self::OnDisk(_) => OpenFlags::empty(),
-            Self::InMemory(_) => {
+            Self::InMemory(_) | Self::Uri { .. } => {
                 // Note that we must use a URI filename to open an
                 // in-memory database in shared-cache mode.
                 // SQLite will return a "library used incorrectly" error if
@@ -319,6 +367,13 @@ impl ConnectionPath for StorePath {
                 // `SQLITE_OPEN_MEMORY | SQLITE_OPEN_SHARED_CACHE`.
                 OpenFlags::SQLITE_OPEN_URI
             }
+        }
+    }
+
+    fn vfs(&self) -> Option<&str> {
+        match self {
+            Self::OnDisk(_) | Self::InMemory(_) => None,
+            Self::Uri { vfs, .. } => vfs.as_deref(),
         }
     }
 }
