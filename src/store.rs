@@ -34,15 +34,40 @@ use crate::{
 ///
 /// When a `Store` with a `CloseSink` is dropped, the `Drop` impl extracts
 /// the open connections and passes them to the sink for asynchronous closing.
-/// The sink implementation chooses which thread to close on.
+///
+/// Closing in the same thread where the database was opened avoids race
+/// conditions between opening and closing file handles by custom virtual
+/// file systems and user-defined functions. [`CloseSink::bind`] is called
+/// on the opener thread so that the returned [`BoundCloseSink`] can capture
+/// whatever thread identity is needed to route the close back there.
+///
+/// If the embedder already coordinates that all other threads are done
+/// before closing, explicit close with a dummy `CloseSink` or
+/// a `BoundCloseSink` that closes inline is sufficient.
 pub trait CloseSink: Send + Sync {
+    /// Called on the opener thread when the store is first opened.
+    /// Returns a bound sink that will handle closing this store.
+    fn bind(&self) -> Box<dyn BoundCloseSink>;
+}
+
+/// A per-store close handler created by [`CloseSink::bind`].
+///
+/// The implementation schedules the actual close on the appropriate
+/// thread. A trivial implementation that calls
+/// [`CloseableStore::close`] inline is valid when the caller already
+/// ensures no other threads are accessing the database.
+pub trait BoundCloseSink: Send + Sync {
     fn schedule_close(&self, closeable: CloseableStore);
 }
 
 /// Holds the extracted connections from a dropped `Store`.
 ///
-/// Call `close()` on a background I/O thread -- it runs `PRAGMA optimize`
-/// and closes both SQLite connections.
+/// Call [`CloseableStore::close`] on a background I/O thread -- it runs
+/// `PRAGMA optimize` and closes both SQLite connections.
+///
+/// Accessing the database after close violates sqlite3 crash-safety
+/// guarantees and may lead to data corruption
+/// (<https://sqlite.org/howtocorrupt.html>).
 pub struct CloseableStore {
     store: Arc<OpenStore>,
 }
@@ -70,6 +95,7 @@ pub struct Store {
     state: Mutex<StoreState>,
     waiter: OperationWaiter,
     close_sink: Option<Arc<dyn CloseSink>>,
+    bound_close_sink: Mutex<Option<Box<dyn BoundCloseSink>>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -79,6 +105,7 @@ impl std::fmt::Debug for Store {
             .field("state", &self.state)
             .field("waiter", &self.waiter)
             .field("close_sink", &self.close_sink.as_ref().map(|_| "..."))
+            .field("bound_close_sink", &self.bound_close_sink.lock().ok().as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -90,6 +117,7 @@ impl Store {
             state: Mutex::new(StoreState::Created),
             waiter: OperationWaiter::new(),
             close_sink: None,
+            bound_close_sink: Mutex::new(None),
         }
     }
 
@@ -99,6 +127,7 @@ impl Store {
             state: Mutex::new(StoreState::Created),
             waiter: OperationWaiter::new(),
             close_sink: Some(sink),
+            bound_close_sink: Mutex::new(None),
         }
     }
 
@@ -116,6 +145,9 @@ impl Store {
                 let result = match &*state {
                     StoreState::Created => {
                         let store = Arc::new(OpenStore::new(&self.path)?);
+                        if let Some(sink) = &self.close_sink {
+                            *self.bound_close_sink.lock().unwrap() = Some(sink.bind());
+                        }
                         *state = StoreState::Open(store);
                         // Advance the state machine, so that the checker can
                         // check the database on first use.
@@ -284,10 +316,10 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        let Some(sink) = self.close_sink.take() else {
+        let Some(sink) = self.bound_close_sink.get_mut().unwrap().take() else {
             return;
         };
-        let state = mem::replace(&mut *self.state.lock().unwrap(), StoreState::Closed);
+        let state = mem::replace(self.state.get_mut().unwrap(), StoreState::Closed);
         match state {
             StoreState::Open(store) | StoreState::Maintenance(store) => {
                 sink.schedule_close(CloseableStore { store });
