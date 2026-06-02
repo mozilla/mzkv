@@ -94,7 +94,7 @@ pub struct Store {
     path: StorePath,
     state: Mutex<StoreState>,
     waiter: OperationWaiter,
-    close_sink: Option<Arc<dyn CloseSink>>,
+    close_sink: Mutex<Option<Arc<dyn CloseSink>>>,
     bound_close_sink: Mutex<Option<Box<dyn BoundCloseSink>>>,
 }
 
@@ -104,8 +104,22 @@ impl std::fmt::Debug for Store {
             .field("path", &self.path)
             .field("state", &self.state)
             .field("waiter", &self.waiter)
-            .field("close_sink", &self.close_sink.as_ref().map(|_| "..."))
-            .field("bound_close_sink", &self.bound_close_sink.lock().ok().as_ref().map(|_| "..."))
+            .field(
+                "close_sink",
+                &self
+                    .close_sink
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|_| "...")),
+            )
+            .field(
+                "bound_close_sink",
+                &self
+                    .bound_close_sink
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|_| "...")),
+            )
             .finish()
     }
 }
@@ -116,19 +130,32 @@ impl Store {
             path,
             state: Mutex::new(StoreState::Created),
             waiter: OperationWaiter::new(),
-            close_sink: None,
+            close_sink: Mutex::new(None),
             bound_close_sink: Mutex::new(None),
         }
     }
 
-    pub fn new_with_close_sink(path: StorePath, sink: Arc<dyn CloseSink>) -> Self {
-        Self {
-            path,
-            state: Mutex::new(StoreState::Created),
-            waiter: OperationWaiter::new(),
-            close_sink: Some(sink),
-            bound_close_sink: Mutex::new(None),
-        }
+    /// Sets the close sink for this store. Must be called before the
+    /// store transitions from `Created` to `Open` (i.e., before the
+    /// first operation).
+    pub fn set_close_sink(&self, sink: Arc<dyn CloseSink>) {
+        debug_assert!(
+            self.state
+                .lock()
+                .ok()
+                .is_some_and(|s| matches!(*s, StoreState::Created)),
+            "close sink must be set before the store is opened"
+        );
+        *self.close_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Returns `true` if this store has a bound close sink that will
+    /// handle closing via [`Store::drop`].
+    pub fn has_bound_close_sink(&self) -> bool {
+        self.bound_close_sink
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.is_some())
     }
 
     /// Gets or opens both connections to the physical database.
@@ -145,7 +172,7 @@ impl Store {
                 let result = match &*state {
                     StoreState::Created => {
                         let store = Arc::new(OpenStore::new(&self.path)?);
-                        if let Some(sink) = &self.close_sink {
+                        if let Some(sink) = self.close_sink.lock().unwrap().take() {
                             *self.bound_close_sink.lock().unwrap() = Some(sink.bind());
                         }
                         *state = StoreState::Open(store);
