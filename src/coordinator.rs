@@ -210,6 +210,19 @@ impl<'a> CoordinatorClient<'a> {
         })
     }
 
+    /// Aborts this client's signal, and the signals of all its
+    /// descendants, without removing clients or closing stores.
+    ///
+    /// This is a lightweight, synchronous operation that does not
+    /// block on I/O, and is safe to call on the main thread.
+    pub fn abort(&self) {
+        let state = self.coordinator.state.lock().unwrap();
+        let max_child_key = self.key.clone().appending(ClientKeyBud::MAX);
+        for (_, client) in state.clients.range(&self.key..=&max_child_key) {
+            client.controller.abort();
+        }
+    }
+
     /// Invalidates this client.
     ///
     /// Invalidation is recursive: if the client has descendants
